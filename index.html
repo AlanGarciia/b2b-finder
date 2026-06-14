@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Buscador B2B</title>
+<style>
+  :root {
+    --teal: #4d9d84;
+    --pink: #efa3c8;
+    --coral: #ef7766;
+    --bg: #0f1419;
+    --panel: #1a2129;
+    --panel2: #232d38;
+    --text: #e8edf2;
+    --muted: #8a97a5;
+    --border: #2c3742;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+    padding: 24px; max-width: 1200px; margin: 0 auto;
+  }
+  header { margin-bottom: 24px; }
+  h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; }
+  h1 span { color: var(--teal); }
+  .sub { color: var(--muted); font-size: 14px; margin-top: 4px; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 20px; margin-bottom: 20px;
+  }
+  .panel h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--muted); margin-bottom: 14px; font-weight: 600; }
+
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; color: var(--muted); font-weight: 500; }
+  input, select {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 10px 12px; border-radius: 9px; font-size: 14px; font-family: inherit;
+    min-width: 140px;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--teal); }
+
+  button {
+    background: var(--teal); color: #fff; border: none; padding: 10px 18px;
+    border-radius: 9px; font-size: 14px; font-weight: 600; cursor: pointer;
+    font-family: inherit; transition: opacity .15s;
+  }
+  button:hover { opacity: 0.88; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary { background: var(--panel2); border: 1px solid var(--border); }
+  button.coral { background: var(--coral); }
+
+  .status { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
+  .status.active { color: var(--teal); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 12px; color: var(--muted);
+    font-weight: 600; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+  td { padding: 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:hover td { background: var(--panel2); }
+  td a { color: var(--teal); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+
+  .tag { display: inline-block; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); padding: 2px 8px; border-radius: 6px; font-size: 11px;
+    margin: 2px 2px 0 0; }
+  .tag.tech { border-color: var(--teal); color: var(--teal); }
+  .social-icons a { margin-right: 8px; color: var(--pink); font-size: 12px; }
+  .email { color: var(--coral); font-size: 12px; word-break: break-all; }
+  .empty { color: var(--muted); text-align: center; padding: 40px; }
+  .count { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+  .spinner { display: inline-block; width: 13px; height: 13px;
+    border: 2px solid var(--border); border-top-color: var(--teal);
+    border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle;
+    margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Buscador <span>B2B</span></h1>
+    <div class="sub">Empresas locales · emails · redes · tecnologías — desde OpenStreetMap</div>
+  </header>
+
+  <!-- PASO 1: buscar -->
+  <div class="panel">
+    <h2>1 · Buscar empresas</h2>
+    <div class="row">
+      <div class="field">
+        <label>Área (ciudad / región)</label>
+        <input id="area" value="Reus" placeholder="Reus, Tarragona, Catalunya...">
+      </div>
+      <div class="field">
+        <label>Categoría</label>
+        <select id="category"></select>
+      </div>
+      <div class="field">
+        <label>Máximo</label>
+        <input id="limit" type="number" value="100" min="1" max="500" style="min-width:90px">
+      </div>
+      <button id="btnIngest" onclick="ingest()">Buscar en OpenStreetMap</button>
+    </div>
+    <div class="status" id="ingestStatus"></div>
+  </div>
+
+  <!-- PASO 2: enriquecer -->
+  <div class="panel">
+    <h2>2 · Enriquecer (emails, redes, tecnologías)</h2>
+    <div class="row">
+      <div class="field">
+        <label>Cuántas procesar</label>
+        <input id="enrichLimit" type="number" value="15" min="1" max="50" style="min-width:90px">
+      </div>
+      <div class="field">
+        <label>Buscar webs que faltan</label>
+        <select id="findMode">
+          <option value="strict">Solo si está seguro (recomendado)</option>
+          <option value="off">No buscar (solo webs de OSM)</option>
+          <option value="loose">Buscar siempre (más errores)</option>
+        </select>
+      </div>
+      <button class="coral" id="btnEnrich" onclick="enrich()">Enriquecer webs</button>
+    </div>
+    <div class="status" id="enrichStatus"></div>
+  </div>
+
+  <!-- PASO 3: resultados -->
+  <div class="panel">
+    <h2>3 · Resultados</h2>
+    <div class="row" style="margin-bottom:16px">
+      <div class="field">
+        <label>Temperatura del lead</label>
+        <select id="filterHeat" onchange="loadCompanies()">
+          <option value="">Todas</option>
+          <option value="muy_caliente">🔥 Muy caliente</option>
+          <option value="caliente">Caliente</option>
+          <option value="tibio">Tibio</option>
+          <option value="frio">Frío</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Oportunidad</label>
+        <select id="filterSignal" onchange="loadCompanies()">
+          <option value="">Cualquiera</option>
+          <option value="sin_web">Sin web</option>
+          <option value="wordpress_clasico">WordPress clásico</option>
+          <option value="stack_anticuado">Stack anticuado</option>
+          <option value="sin_redes">Sin redes</option>
+          <option value="tiene_ecommerce">Tiene ecommerce</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Tecnología</label>
+        <input id="filterTech" placeholder="WordPress...">
+      </div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <label style="flex-direction:row;display:flex;align-items:center;gap:6px;color:var(--text);font-size:14px">
+          <input type="checkbox" id="filterEmail" style="min-width:auto;width:16px;height:16px" onchange="loadCompanies()">
+          Con email
+        </label>
+      </div>
+      <button class="secondary" onclick="loadCompanies()">Aplicar</button>
+      <button class="secondary" onclick="exportCSV()">⬇ CSV</button>
+    </div>
+    <div class="count" id="count"></div>
+    <div id="results"></div>
+  </div>
+
+<script>
+const API = ""; // mismo origen
+
+async function loadCategories() {
+  const NICE = { todos: "🔍 Todos los negocios" };
+  try {
+    const r = await fetch(API + "/categories");
+    const d = await r.json();
+    const sel = document.getElementById("category");
+    sel.innerHTML = d.categories.map(c =>
+      `<option value="${c}">${NICE[c] || c.charAt(0).toUpperCase()+c.slice(1)}</option>`
+    ).join("");
+  } catch(e) { /* api no levantada aún */ }
+}
+
+async function ingest() {
+  const btn = document.getElementById("btnIngest");
+  const status = document.getElementById("ingestStatus");
+  const area = document.getElementById("area").value.trim();
+  const category = document.getElementById("category").value;
+  const limit = document.getElementById("limit").value;
+  if (!area) { status.textContent = "Escribe un área."; return; }
+
+  btn.disabled = true;
+  status.className = "status active";
+  status.innerHTML = `<span class="spinner"></span> Buscando en OpenStreetMap...`;
+  try {
+    const r = await fetch(`${API}/ingest?area=${encodeURIComponent(area)}&category=${category}&limit=${limit}`, { method: "POST" });
+    const d = await r.json();
+    status.innerHTML = `✓ ${d.found} empresas encontradas (${d.with_website} con web). Ya puedes enriquecer.`;
+    loadCompanies();
+  } catch(e) {
+    status.className = "status";
+    status.textContent = "✗ Error: " + e.message + " — ¿está el servidor arrancado?";
+  }
+  btn.disabled = false;
+}
+
+async function enrich() {
+  const btn = document.getElementById("btnEnrich");
+  const status = document.getElementById("enrichStatus");
+  const limit = document.getElementById("enrichLimit").value;
+  const findMode = document.getElementById("findMode").value;
+  btn.disabled = true;
+  status.className = "status active";
+  status.innerHTML = `<span class="spinner"></span> Visitando webs y extrayendo datos... (puede tardar 1-2 min)`;
+  try {
+    const r = await fetch(`${API}/enrich?limit=${limit}&find_websites=${findMode}`, { method: "POST" });
+    const d = await r.json();
+    status.innerHTML = `✓ ${d.enriched} empresas enriquecidas.`;
+    loadCompanies();
+  } catch(e) {
+    status.className = "status";
+    status.textContent = "✗ Error: " + e.message;
+  }
+  btn.disabled = false;
+}
+
+async function loadCompanies() {
+  const tech = document.getElementById("filterTech").value.trim();
+  const hasEmail = document.getElementById("filterEmail").checked;
+  const heat = document.getElementById("filterHeat").value;
+  const signal = document.getElementById("filterSignal").value;
+  let url = `${API}/companies?limit=300&sort_by_priority=true`;
+  if (tech) url += `&tech=${encodeURIComponent(tech)}`;
+  if (hasEmail) url += `&has_email=true`;
+  if (heat) url += `&heat=${heat}`;
+  if (signal) url += `&signal=${signal}`;
+
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    render(d.companies);
+    document.getElementById("count").textContent = `${d.count} empresas`;
+  } catch(e) {
+    document.getElementById("results").innerHTML = `<div class="empty">No se pudo cargar. ¿Servidor arrancado?</div>`;
+  }
+}
+
+const HEAT_STYLE = {
+  muy_caliente: { label: "🔥 Muy caliente", bg: "#4A1B0C", color: "#F0997B" },
+  caliente:     { label: "Caliente",       bg: "#633806", color: "#FAC775" },
+  tibio:        { label: "Tibio",          bg: "#085041", color: "#5DCAA5" },
+  frio:         { label: "Frío",           bg: "#232d38", color: "#8a97a5" },
+};
+
+const SIGNAL_LABELS = {
+  sin_web: "Sin web", wordpress_clasico: "WP clásico", stack_anticuado: "Stack viejo",
+  web_plantilla: "Plantilla", sin_redes: "Sin redes", pocas_redes: "Pocas redes",
+  solo_telefono: "Solo tel.", tiene_ecommerce: "Ecommerce", sin_analitica: "Sin analítica",
+};
+
+function render(companies) {
+  const box = document.getElementById("results");
+  if (!companies.length) {
+    box.innerHTML = `<div class="empty">Sin resultados todavía. Haz una búsqueda arriba ↑</div>`;
+    return;
+  }
+  let html = `<table><thead><tr>
+    <th>Lead</th><th>Empresa</th><th>Contacto</th><th>Oportunidad</th><th>Tecnologías</th>
+    </tr></thead><tbody>`;
+  for (const c of companies) {
+    const h = HEAT_STYLE[c.heat] || HEAT_STYLE.frio;
+    const heatBadge = `<span style="background:${h.bg};color:${h.color};padding:3px 9px;border-radius:6px;font-size:11px;font-weight:600;white-space:nowrap">${h.label}</span>`;
+    const social = Object.entries(c.social || {}).map(([k,v]) =>
+      `<a href="${v}" target="_blank" title="${k}">${k}</a>`).join(" ");
+    const tech = (c.technologies || []).map(t => `<span class="tag tech">${t}</span>`).join("");
+    const emails = (c.emails || []).map(e => `<div class="email">${e}</div>`).join("");
+    const phone = c.phone ? `<div style="font-size:11px;color:var(--muted)">☎ ${c.phone}</div>` : "";
+    const web = c.website ? `<a href="${c.website}" target="_blank" style="font-size:11px">${c.website.replace(/^https?:\/\//,'').slice(0,24)}</a>` : '<span style="color:var(--coral);font-size:11px">sin web</span>';
+    const signals = (c.signals || []).map(s =>
+      `<span style="display:inline-block;background:var(--panel2);border:1px solid var(--coral);color:var(--coral);padding:1px 7px;border-radius:5px;font-size:10px;margin:1px">${SIGNAL_LABELS[s]||s}</span>`).join("");
+
+    html += `<tr>
+      <td>${heatBadge}</td>
+      <td><strong>${c.name}</strong><br><span style="color:var(--muted);font-size:11px">${c.address||''}</span><br>${web}</td>
+      <td>${emails || '<span style="color:var(--muted);font-size:11px">—</span>'}${phone}<div class="social-icons" style="margin-top:3px">${social}</div></td>
+      <td>${signals || '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${tech || '<span style="color:var(--muted)">—</span>'}</td>
+    </tr>`;
+  }
+  html += `</tbody></table>`;
+  box.innerHTML = html;
+}
+
+function exportCSV() {
+  window.location.href = `${API}/export.csv`;
+}
+
+loadCategories();
+loadCompanies();
+</script>
+</body>
+</html>

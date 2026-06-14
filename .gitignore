@@ -1,0 +1,28 @@
+# Base de datos local (datos de prueba, no se sube)
+*.db
+b2b.db
+
+# Exportaciones generadas
+export.csv
+export.json
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Entorno / secretos (por si en el futuro guardas claves)
+.env
+*.key
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editores
+.vscode/
+.idea/

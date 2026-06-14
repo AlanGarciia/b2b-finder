@@ -1,0 +1,198 @@
+"""
+API REST del buscador B2B.
+Ejecuta:  uvicorn api:app --reload
+Docs interactivas en  http://localhost:8000/docs
+"""
+import io
+import csv
+import asyncio
+from pathlib import Path
+from fastapi import FastAPI, Query, BackgroundTasks
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+
+import db
+from overpass import fetch_companies, CATEGORIES
+from scraper import scrape_company
+from website_finder import find_website
+from email_verify import verify_emails, best_emails
+from sales_signals import detect_signals, SIGNAL_LABELS
+
+app = FastAPI(title="Buscador B2B", version="0.1")
+
+db.init_db()
+
+BASE_DIR = Path(__file__).parent
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    """Sirve la interfaz web."""
+    index = BASE_DIR / "index.html"
+    if index.exists():
+        return HTMLResponse(index.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>index.html no encontrado</h1>")
+
+
+@app.get("/api")
+def api_info():
+    return {
+        "service": "Buscador de nicho B2B",
+        "endpoints": {
+            "GET /categories": "categorías disponibles",
+            "POST /ingest": "buscar empresas de un área (params: area, category, limit)",
+            "POST /enrich": "enriquecer empresas pendientes (emails, redes, tech)",
+            "GET /companies": "consultar resultados (filtros: area, category, tech, has_email)",
+            "GET /export.csv": "descargar todo en CSV",
+        },
+    }
+
+
+@app.get("/export.csv")
+def export_csv():
+    """Descarga todas las empresas en CSV."""
+    rows = db.get_companies(limit=10000)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["name", "website", "phone", "address", "heat", "signals",
+                "emails", "social", "technologies"])
+    for r in rows:
+        w.writerow([
+            r["name"], r["website"], r["phone"], r["address"],
+            r.get("heat", ""), "; ".join(r.get("signals", [])),
+            "; ".join(r["emails"]),
+            "; ".join(f"{k}:{v}" for k, v in r["social"].items()),
+            "; ".join(r["technologies"]),
+        ])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=leads_b2b.csv"},
+    )
+
+
+@app.get("/categories")
+def categories():
+    return {"categories": list(CATEGORIES.keys())}
+
+
+@app.post("/ingest")
+async def ingest(
+    area: str = Query(..., description="Nombre del área OSM: 'Reus', 'Catalunya', 'España'"),
+    category: str = Query("empresas"),
+    limit: int = Query(50, le=200),
+):
+    """Trae empresas de OpenStreetMap y las guarda."""
+    companies = await fetch_companies(area, category, limit)
+    for comp in companies:
+        db.upsert_company(comp, area)
+    return {
+        "area": area, "category": category,
+        "found": len(companies),
+        "with_website": sum(1 for c in companies if c["website"]),
+    }
+
+
+async def _enrich_one(comp, find_mode="strict"):
+    """Enriquece una empresa: busca web si falta + scraping + verificación email + señales."""
+    import json
+    website = comp.get("website") or ""
+    found_method = ""
+
+    # si OSM no trae web, intentamos encontrarla (adivinar dominio + DuckDuckGo)
+    if not website:
+        try:
+            city = (comp.get("address") or "").split(",")[-1].strip() or comp.get("area", "")
+            wf = await find_website(comp["name"], city, mode=find_mode)
+            if wf["website"]:
+                website = wf["website"]
+                found_method = wf["method"]
+        except Exception:
+            pass
+
+    data = {"emails": [], "social": {}, "technologies": []}
+    if website:
+        try:
+            data = await scrape_company(website)
+        except Exception:
+            pass
+
+    existing = json.loads(comp.get("emails") or "[]")
+    raw_emails = sorted(set(existing) | set(data.get("emails", [])))
+
+    # verificación de emails (MX + formato + scoring)
+    verified = await verify_emails(raw_emails) if raw_emails else []
+    good_emails = best_emails(verified, min_score=50)
+    top_score = max((v["score"] for v in verified), default=0)
+
+    # construimos el objeto para detectar señales
+    enriched_company = {
+        "website": website,
+        "emails": good_emails,
+        "social": data.get("social", {}),
+        "technologies": data.get("technologies", []),
+        "phone": comp.get("phone", ""),
+    }
+    sig = detect_signals(enriched_company)
+
+    # guardar la web si la encontramos automáticamente
+    if found_method and website:
+        db.update_website(comp["osm_id"], website)
+
+    db.update_enrichment(
+        comp["osm_id"], good_emails, data.get("social", {}), data.get("technologies", []),
+        signals=sig["signals"], heat=sig["heat"], priority=sig["priority"],
+        email_score=top_score,
+    )
+    return {
+        "name": comp["name"],
+        "website": website,
+        "website_found": found_method,  # 'guess', 'search' o ''
+        "emails": good_emails,
+        "social": data.get("social", {}),
+        "technologies": data.get("technologies", []),
+        "signals": sig["signals"],
+        "heat": sig["heat"],
+        "priority": sig["priority"],
+    }
+
+
+@app.post("/enrich")
+async def enrich(limit: int = Query(15, le=50), concurrency: int = Query(3, le=8),
+                 find_websites: str = Query("strict", description="strict | loose | off — buscar webs que faltan")):
+    """Enriquece webs pendientes en paralelo: emails verificados, redes, tech y señales de venta."""
+    pending = db.get_unenriched(limit)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def bounded(comp):
+        async with sem:
+            return await _enrich_one(comp, find_mode=find_websites)
+
+    results = await asyncio.gather(*[bounded(c) for c in pending], return_exceptions=True)
+    ok = [r for r in results if isinstance(r, dict)]
+    # ordenamos por prioridad: los leads más calientes primero
+    ok.sort(key=lambda r: r["priority"], reverse=True)
+    return {"enriched": len(ok), "results": ok}
+
+
+@app.get("/companies")
+def companies(
+    area: str = None,
+    category: str = None,
+    tech: str = Query(None, description="Filtrar por tecnología, ej: 'WordPress'"),
+    has_email: bool = False,
+    heat: str = Query(None, description="frio/tibio/caliente/muy_caliente"),
+    signal: str = Query(None, description="Filtrar por señal, ej: 'sin_web'"),
+    sort_by_priority: bool = Query(True, description="Ordenar por lead más caliente"),
+    limit: int = Query(100, le=500),
+):
+    """Consulta los datos recopilados, ordenados por oportunidad de venta."""
+    data = db.get_companies(area, category, tech, has_email, heat, signal,
+                            sort_by_priority, limit)
+    return {"count": len(data), "companies": data}
+
+
+@app.get("/signals")
+def signals_info():
+    """Devuelve las señales de venta disponibles y su descripción."""
+    return {"signals": SIGNAL_LABELS}
