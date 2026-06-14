@@ -28,6 +28,10 @@ def init_db():
             heat          TEXT,   -- frio/tibio/caliente/muy_caliente
             priority      INTEGER DEFAULT 0,
             email_score   INTEGER DEFAULT 0,
+            source        TEXT DEFAULT 'openstreetmap',  -- procedencia del dato (RGPD)
+            source_url    TEXT,                           -- de dónde vino exactamente
+            has_personal  INTEGER DEFAULT 0,              -- ¿contiene datos personales?
+            first_seen    TIMESTAMP,                      -- cuándo se recopiló
             enriched      INTEGER DEFAULT 0,
             scraped_at    TIMESTAMP
         )
@@ -38,11 +42,24 @@ def init_db():
             ("heat", "ALTER TABLE companies ADD COLUMN heat TEXT"),
             ("priority", "ALTER TABLE companies ADD COLUMN priority INTEGER DEFAULT 0"),
             ("email_score", "ALTER TABLE companies ADD COLUMN email_score INTEGER DEFAULT 0"),
+            ("source", "ALTER TABLE companies ADD COLUMN source TEXT DEFAULT 'openstreetmap'"),
+            ("source_url", "ALTER TABLE companies ADD COLUMN source_url TEXT"),
+            ("has_personal", "ALTER TABLE companies ADD COLUMN has_personal INTEGER DEFAULT 0"),
+            ("first_seen", "ALTER TABLE companies ADD COLUMN first_seen TIMESTAMP"),
         ]:
             try:
                 c.execute(ddl)
             except Exception:
                 pass
+        # tabla de exclusión (opt-out): emails/dominios que NUNCA deben aparecer
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS opt_out (
+            value      TEXT PRIMARY KEY,   -- email o dominio a excluir
+            kind       TEXT,               -- 'email' | 'domain'
+            added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reason     TEXT
+        )
+        """)
         # índices (después de garantizar que las columnas existen)
         c.execute("CREATE INDEX IF NOT EXISTS idx_area ON companies(area)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_cat ON companies(category)")
@@ -61,10 +78,12 @@ def get_conn():
 
 
 def upsert_company(comp: dict, area: str):
+    source = comp.get("source", "openstreetmap")
+    source_url = comp.get("source_url", "")
     with get_conn() as c:
         c.execute("""
-        INSERT INTO companies (osm_id, name, website, phone, address, category, area, lat, lon, emails, social, technologies, enriched)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)
+        INSERT INTO companies (osm_id, name, website, phone, address, category, area, lat, lon, emails, social, technologies, source, source_url, first_seen, enriched)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,0)
         ON CONFLICT(osm_id) DO UPDATE SET
             name=excluded.name, website=excluded.website, phone=excluded.phone,
             address=excluded.address, category=excluded.category, area=excluded.area,
@@ -75,6 +94,7 @@ def upsert_company(comp: dict, area: str):
             comp.get("lat"), comp.get("lon"),
             json.dumps([comp["email_osm"]] if comp.get("email_osm") else []),
             json.dumps({}), json.dumps([]),
+            source, source_url,
         ))
 
 
@@ -136,3 +156,38 @@ def get_unenriched(limit=20):
             "SELECT * FROM companies WHERE enriched=0 LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# --- Lista de exclusión (opt-out / RGPD) ---
+
+def add_opt_out(value, kind="email", reason=""):
+    """Añade un email o dominio a la lista de exclusión."""
+    with get_conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO opt_out (value, kind, reason) VALUES (?,?,?)",
+            (value.strip().lower(), kind, reason),
+        )
+
+
+def remove_opt_out(value):
+    with get_conn() as c:
+        c.execute("DELETE FROM opt_out WHERE value=?", (value.strip().lower(),))
+
+
+def get_opt_out_set():
+    """Devuelve un set con todos los valores excluidos (para filtrar rápido)."""
+    with get_conn() as c:
+        rows = c.execute("SELECT value FROM opt_out").fetchall()
+    return {r["value"] for r in rows}
+
+
+def list_opt_out():
+    with get_conn() as c:
+        rows = c.execute("SELECT * FROM opt_out ORDER BY added_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_personal(osm_id, has_personal):
+    with get_conn() as c:
+        c.execute("UPDATE companies SET has_personal=? WHERE osm_id=?",
+                  (1 if has_personal else 0, osm_id))

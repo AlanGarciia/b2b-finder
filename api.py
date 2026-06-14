@@ -16,6 +16,8 @@ from scraper import scrape_company
 from website_finder import find_website
 from email_verify import verify_emails, best_emails
 from sales_signals import detect_signals, SIGNAL_LABELS
+from compliance import (has_personal_data, apply_opt_out, filter_for_resale,
+                        split_emails, ATTRIBUTION_TEXT)
 
 app = FastAPI(title="Buscador B2B", version="0.1")
 
@@ -98,15 +100,18 @@ async def _enrich_one(comp, find_mode="strict"):
     import json
     website = comp.get("website") or ""
     found_method = ""
+    found_confidence = 0
 
-    # si OSM no trae web, intentamos encontrarla (adivinar dominio + DuckDuckGo)
+    # si OSM no trae web, intentamos encontrarla (con scoring de confianza)
     if not website:
         try:
             city = (comp.get("address") or "").split(",")[-1].strip() or comp.get("area", "")
-            wf = await find_website(comp["name"], city, mode=find_mode)
+            wf = await find_website(comp["name"], city,
+                                    phone=comp.get("phone", ""), mode=find_mode)
             if wf["website"]:
                 website = wf["website"]
                 found_method = wf["method"]
+                found_confidence = wf.get("confidence", 0)
         except Exception:
             pass
 
@@ -124,6 +129,13 @@ async def _enrich_one(comp, find_mode="strict"):
     verified = await verify_emails(raw_emails) if raw_emails else []
     good_emails = best_emails(verified, min_score=50)
     top_score = max((v["score"] for v in verified), default=0)
+
+    # RGPD: aplicar lista de exclusión (opt-out) — quitar emails que pidieron baja
+    opt_out = db.get_opt_out_set()
+    good_emails = apply_opt_out(good_emails, opt_out)
+
+    # RGPD: marcar si la empresa tiene datos personales (nombre.apellido@...)
+    contains_personal = has_personal_data(good_emails)
 
     # construimos el objeto para detectar señales
     enriched_company = {
@@ -144,10 +156,12 @@ async def _enrich_one(comp, find_mode="strict"):
         signals=sig["signals"], heat=sig["heat"], priority=sig["priority"],
         email_score=top_score,
     )
+    db.mark_personal(comp["osm_id"], contains_personal)
     return {
         "name": comp["name"],
         "website": website,
         "website_found": found_method,  # 'guess', 'search' o ''
+        "website_confidence": found_confidence,  # 0-100
         "emails": good_emails,
         "social": data.get("social", {}),
         "technologies": data.get("technologies", []),
@@ -196,3 +210,63 @@ def companies(
 def signals_info():
     """Devuelve las señales de venta disponibles y su descripción."""
     return {"signals": SIGNAL_LABELS}
+
+
+# --- Endpoints de cumplimiento RGPD ---
+
+@app.get("/optout")
+def list_optout():
+    """Lista de exclusión actual (emails/dominios que pidieron baja)."""
+    return {"opt_out": db.list_opt_out()}
+
+
+@app.post("/optout")
+def add_optout(value: str = Query(..., description="email o dominio a excluir"),
+               kind: str = Query("email", description="email | domain"),
+               reason: str = Query("", description="motivo (opcional)")):
+    """Añade un email o dominio a la lista de exclusión (derecho de supresión RGPD)."""
+    db.add_opt_out(value, kind, reason)
+    return {"ok": True, "excluded": value.strip().lower()}
+
+
+@app.delete("/optout")
+def del_optout(value: str = Query(...)):
+    """Quita un valor de la lista de exclusión."""
+    db.remove_opt_out(value)
+    return {"ok": True, "removed": value.strip().lower()}
+
+
+@app.get("/export-safe.csv")
+def export_safe_csv(include_personal: bool = Query(False, description="incluir emails personales (bajo tu responsabilidad)")):
+    """
+    Exportación MODO SEGURO para reventa (RGPD).
+    Por defecto excluye emails personales (nombre.apellido@) y solo incluye
+    datos genéricos de empresa. Incluye la atribución obligatoria de OpenStreetMap.
+    """
+    rows = db.get_companies(limit=10000)
+    opt_out = db.get_opt_out_set()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["name", "website", "phone", "address", "category", "heat",
+                "emails_empresa", "social", "technologies", "fuente"])
+    for r in rows:
+        # aplicar opt-out y filtrar personales
+        emails = apply_opt_out(r.get("emails", []), opt_out)
+        r_filtered = filter_for_resale({"emails": emails}, include_personal)
+        w.writerow([
+            r["name"], r["website"], r["phone"], r["address"], r.get("category", ""),
+            r.get("heat", ""),
+            "; ".join(r_filtered["emails"]),
+            "; ".join(f"{k}:{v}" for k, v in r["social"].items()),
+            "; ".join(r["technologies"]),
+            r.get("source", "openstreetmap"),
+        ])
+    # atribución obligatoria al final
+    w.writerow([])
+    w.writerow([ATTRIBUTION_TEXT])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=leads_seguro.csv"},
+    )
