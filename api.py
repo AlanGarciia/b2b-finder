@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 import db
 from overpass import fetch_companies, CATEGORIES
 from scraper import scrape_company
-from website_finder import find_website
+from website_finder import find_website, website_from_email, website_from_social
 from email_verify import verify_emails, best_emails
 from sales_signals import detect_signals, SIGNAL_LABELS
 from compliance import (has_personal_data, apply_opt_out, filter_for_resale,
@@ -102,18 +102,29 @@ async def _enrich_one(comp, find_mode="strict"):
     found_method = ""
     found_confidence = 0
 
-    # si OSM no trae web, intentamos encontrarla (con scoring de confianza)
+    # si OSM no trae web, intentamos encontrarla
     if not website:
-        try:
-            city = (comp.get("address") or "").split(",")[-1].strip() or comp.get("area", "")
-            wf = await find_website(comp["name"], city,
-                                    phone=comp.get("phone", ""), mode=find_mode)
-            if wf["website"]:
-                website = wf["website"]
-                found_method = wf["method"]
-                found_confidence = wf.get("confidence", 0)
-        except Exception:
-            pass
+        # 1º) ¿OSM trae un email de empresa? su dominio ES la web (definitivo)
+        osm_emails = json.loads(comp.get("emails") or "[]")
+        if osm_emails:
+            web_from_mail = website_from_email(osm_emails)
+            if web_from_mail:
+                website = web_from_mail
+                found_method = "email"
+                found_confidence = 95
+
+        # 2º) si aún no hay, adivinar dominio + buscadores (con scoring)
+        if not website:
+            try:
+                city = (comp.get("address") or "").split(",")[-1].strip() or comp.get("area", "")
+                wf = await find_website(comp["name"], city,
+                                        phone=comp.get("phone", ""), mode=find_mode)
+                if wf["website"]:
+                    website = wf["website"]
+                    found_method = wf["method"]
+                    found_confidence = wf.get("confidence", 0)
+            except Exception:
+                pass
 
     data = {"emails": [], "social": {}, "technologies": []}
     if website:
@@ -121,6 +132,46 @@ async def _enrich_one(comp, find_mode="strict"):
             data = await scrape_company(website)
         except Exception:
             pass
+
+    # 3º) RESCATE: si seguimos sin web (o poco fiable) pero el scraping/OSM
+    # reveló email de dominio propio o redes sociales, deducir la web de ahí.
+    if not website or found_confidence < 50:
+        recovered = ""
+        rec_method = ""
+        # web desde el email encontrado (dominio propio)
+        scraped_emails = data.get("emails", [])
+        web_mail = website_from_email(scraped_emails)
+        if web_mail:
+            recovered = web_mail
+            rec_method = "email"
+        # web desde el perfil de redes sociales
+        if not recovered and data.get("social"):
+            try:
+                import httpx as _httpx
+                async with _httpx.AsyncClient(
+                    headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True
+                ) as _c:
+                    web_soc = await website_from_social(_c, data["social"])
+                if web_soc:
+                    recovered = web_soc
+                    rec_method = "social"
+            except Exception:
+                pass
+        # si recuperamos una web nueva, scrapearla para sacar más datos
+        if recovered and recovered.rstrip("/") != (website or "").rstrip("/"):
+            website = recovered
+            found_method = rec_method
+            found_confidence = 90 if rec_method == "email" else 75
+            try:
+                data2 = await scrape_company(website)
+                # fusionar datos de ambos scrapeos
+                data["emails"] = sorted(set(data.get("emails", [])) | set(data2.get("emails", [])))
+                data["technologies"] = sorted(set(data.get("technologies", [])) | set(data2.get("technologies", [])))
+                merged_social = dict(data.get("social", {}))
+                merged_social.update(data2.get("social", {}))
+                data["social"] = merged_social
+            except Exception:
+                pass
 
     existing = json.loads(comp.get("emails") or "[]")
     raw_emails = sorted(set(existing) | set(data.get("emails", [])))

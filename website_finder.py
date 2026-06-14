@@ -389,6 +389,66 @@ async def _candidates_from_search(client, query: str, delay: float) -> list:
     return combined
 
 
+def website_from_email(emails: list) -> str:
+    """
+    Deduce la web a partir del dominio de un email de empresa.
+    'info@floristeriamar.cat' -> 'https://floristeriamar.cat'
+    Solo usa emails de dominio propio (descarta gmail, hotmail, etc.).
+    Señal casi definitiva: el negocio usa ese dominio para su correo.
+    """
+    FREE = {"gmail.com", "hotmail.com", "hotmail.es", "yahoo.com", "yahoo.es",
+            "outlook.com", "outlook.es", "live.com", "icloud.com", "me.com",
+            "telefonica.net", "terra.es", "wanadoo.es"}
+    for email in emails:
+        email = (email or "").strip().lower()
+        if "@" not in email:
+            continue
+        domain = email.split("@")[1]
+        if domain in FREE:
+            continue
+        if "." not in domain or len(domain) < 4:
+            continue
+        return "https://" + domain
+    return ""
+
+
+async def website_from_social(client, social: dict) -> str:
+    """
+    Visita el perfil de redes sociales del negocio y extrae el enlace a su web.
+    El negocio pone su web oficial en la bio de Instagram/Facebook -> fiabilidad alta.
+    Devuelve la URL de la web o '' si no encuentra.
+    """
+    # orden de preferencia: las que suelen tener web en bio
+    for net in ("facebook", "instagram", "linkedin"):
+        url = social.get(net)
+        if not url:
+            continue
+        try:
+            r = await client.get(url, timeout=10.0, follow_redirects=True)
+            if r.status_code != 200:
+                continue
+            html = r.text
+            # buscar URLs externas que NO sean la propia red social ni otra red
+            candidates = re.findall(r'https?://[^\s"\'<>)]+', html)
+            for c in candidates:
+                host = urlparse(c).netloc.lower()
+                if not host:
+                    continue
+                # descartar la propia red social y otras redes/CDN
+                if _is_official(c) and not any(
+                    bad in host for bad in
+                    ("facebook", "instagram", "linkedin", "fbcdn", "cdninstagram",
+                     "licdn", "twitter", "x.com", "youtube", "tiktok", "whatsapp",
+                     "google", "gstatic", "bit.ly", "linktr.ee")
+                ):
+                    # heurística: dominio corto y con pinta de web de empresa
+                    if host.count(".") <= 2 and len(host) < 40:
+                        return c.split("?")[0].rstrip("/")
+        except Exception:
+            continue
+    return ""
+
+
 async def find_website(name: str, city: str = "", phone: str = "",
                        delay: float = 1.0, mode: str = "strict") -> dict:
     """
